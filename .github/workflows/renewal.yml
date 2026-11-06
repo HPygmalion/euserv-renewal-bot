@@ -15,19 +15,48 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Record resolved Python version
+        id: pyver
+        # 从真实解释器取版本，而不是依赖 action 的输出契约：缓存 key 必须能区分 3.12.15 / 3.12.16
+        run: echo "version=$(python -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
       - name: Cache Virtual Environment
         id: cache-venv
         uses: actions/cache@v5
         with:
           path: venv
-          key: ${{ runner.os }}-venv-${{ hashFiles('requirements.txt') }}
-      - name: Create venv and Install dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+          # 运行器镜像升级 Python 微版本（如 3.12.15 → 3.12.16）会让旧 venv 的 bin/python
+          # 符号链接悬空；若 key 不含版本，缓存命中还会跳过依赖安装，最终静默降级到系统 Python。
+          key: ${{ runner.os }}-venv-${{ steps.pyver.outputs.version }}-${{ hashFiles('requirements.txt') }}
+      - name: Ensure venv and dependencies
+        # 无条件执行（不再依赖 cache-hit 布尔值）：缓存只负责加速，环境正确性必须每次自证
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          set -uo pipefail
+          echo "运行器解析到的 Python: ${{ steps.pyver.outputs.version }}"
+
+          recreate_venv() {
+            echo "重建 venv ..."
+            rm -rf venv
+            python -m venv venv
+            ./venv/bin/python -m pip install --upgrade pip
+            ./venv/bin/python -m pip install -r requirements.txt
+          }
+
+          # 1) 解释器必须真实可执行（悬空符号链接说明缓存来自另一个 Python 微版本）
+          if [ ! -x venv/bin/python ] || ! ./venv/bin/python -c 'import sys' >/dev/null 2>&1; then
+            echo "::warning::venv 缺失或解释器失效，重建虚拟环境"
+            recreate_venv
+          fi
+
+          # 2) 依赖必须可导入；先按 requirements 重装，仍不行则整体重建
+          if ! ./venv/bin/python -c 'import requests, bs4, ddddocr' >/dev/null 2>&1; then
+            echo "::warning::venv 依赖不完整，按 requirements.txt 重装"
+            ./venv/bin/python -m pip install -r requirements.txt || recreate_venv
+          fi
+
+          # 3) 自证：任何一步没兜住，就在这里硬失败，绝不带着坏环境往下跑
+          echo "---------- 环境自检 ----------"
+          ./venv/bin/python -V
+          ./venv/bin/python -c 'import sys, requests, bs4, ddddocr; print("deps OK | requests", requests.__version__, "| sys.prefix", sys.prefix)'
       - name: Run renewal script with retry
         id: renewal
         env:
@@ -43,7 +72,12 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
-          source venv/bin/activate
+          # 环境类错误是确定性的：重试 3 次只会白烧 1 小时，还会跨过监控门控点（实测 04:09→05:09Z）
+          if ! ./venv/bin/python -c 'import requests, bs4, ddddocr' >/dev/null 2>&1; then
+            echo "::error::运行环境损坏（依赖不可导入），立即失败，不进入重试循环"
+            ./venv/bin/python -V || true
+            exit 1
+          fi
 
           MAX_RETRIES=3
           RETRY_DELAY=1800  # 30分钟 (秒)
@@ -54,7 +88,7 @@ jobs:
             echo "========================================="
             
             set +e  # 允许非零退出码
-            python Euserv_Renewal.py
+            ./venv/bin/python Euserv_Renewal.py
             EXIT_CODE=$?
             set -e
             
